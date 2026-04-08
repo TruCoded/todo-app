@@ -14,7 +14,7 @@ A simple todo and notes web app built using C++ compiled to WebAssembly with Ems
 2. Open todo_app.html using Live Server
 
 ## Author
-Your Name
+Trusha
 
 ## License
 MIT
