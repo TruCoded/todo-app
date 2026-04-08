@@ -444,7 +444,7 @@ input[type=color]{
   background-image:radial-gradient(circle at 1px 1px,rgba(200,170,160,0.35) 1px,transparent 0);
   background-size:22px 22px;
 }
-canvas#draw-canvas{display:block;touch-action:none;cursor:crosshair;position:absolute;top:0;left:0;}
+canvas#draw-canvas{display:block;touch-action:none;cursor:crosshair}
 .draw-hint{
   position:absolute;bottom:14px;left:50%;transform:translateX(-50%);
   font-size:11px;color:var(--text3);pointer-events:none;
@@ -823,11 +823,7 @@ function switchPanel(name,el){
   document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   el.classList.add('active');
-  if(name==='draw'){
-    requestAnimationFrame(function(){
-      if(typeof resizeCanvas==='function' && layers && layers.length) resizeCanvas();
-    });
-  }
+  if(name==='draw') resizeCanvas();
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -999,475 +995,331 @@ function delNote(id){ DB.delNote(id); renderNotes(); }
 document.getElementById('note-modal').addEventListener('click',function(e){ if(e.target===this) closeNoteModal(); });
 
 /* ═══════════════════════════════════════════════════════════
-   DRAW ENGINE — clean rewrite, fully synchronous, works reliably
+   DRAW — Procreate-style multi-layer canvas engine
    ═══════════════════════════════════════════════════════════ */
+const mainCanvas=document.getElementById('draw-canvas');
+const ctx=mainCanvas.getContext('2d');
+let drawCol='#3d2e28', bSize=6, bOpacity=1, bFlow=0.8;
+let currentTool='pen';
+let isDown=false, lastX=0, lastY=0, startX=0, startY=0;
+let snapData=null, historyStack=[], redoStack=[];
+let textEl=null;
+let pressure=0.5; // simulated
 
-// ── Canvas setup ─────────────────────────────────────────
-const mainCanvas = document.getElementById('draw-canvas');
-const ctx        = mainCanvas.getContext('2d');
+// Multi-layer
+let layers=[], activeLayerIdx=0;
+function mkCanvas(){ const c=document.createElement('canvas'); c.width=mainCanvas.width; c.height=mainCanvas.height; return c; }
+function mkLayer(name){ return {name, canvas:mkCanvas(), visible:true, opacity:1}; }
 
-// ── Draw state ───────────────────────────────────────────
-let drawCol     = '#3d2e28';
-let bSize       = 6;
-let bOpacity    = 1.0;
-let bFlow       = 0.8;
-let currentTool = 'pen';
-let isDown      = false;
-let lastX = 0, lastY = 0, startX = 0, startY = 0;
-let pressure    = 0.5;
-let snapImageData = null;
-let historyStack  = [];
-let redoStack     = [];
-let textEl        = null;
-
-// ── Layers ───────────────────────────────────────────────
-let layers = [], activeLayerIdx = 0;
-
-function newLayerCanvas() {
-  const c = document.createElement('canvas');
-  c.width  = Math.max(mainCanvas.width,  100);
-  c.height = Math.max(mainCanvas.height, 100);
-  return c;
-}
-
-function initLayers() {
-  layers = [{ name:'Layer 1', canvas: newLayerCanvas(), visible:true, opacity:1 }];
-  activeLayerIdx = 0;
+function initLayers(){
+  layers=[mkLayer('Layer 1')];
+  activeLayerIdx=0;
   renderLayers();
 }
 
-function addLayer() {
-  layers.unshift({ name:'Layer '+(layers.length+1), canvas: newLayerCanvas(), visible:true, opacity:1 });
-  activeLayerIdx = 0;
-  renderLayers();
+function addLayer(){
+  const idx=layers.length+1;
+  layers.unshift(mkLayer('Layer '+idx));
+  activeLayerIdx=0;
+  renderLayers(); compositeAll();
 }
 
-function setActiveLayer(i) { activeLayerIdx = i; renderLayers(); }
-
-function getLCtx() {
-  return layers[activeLayerIdx].canvas.getContext('2d');
-}
-
-function compositeAll() {
-  ctx.clearRect(0, 0, mainCanvas.width, mainCanvas.height);
-  for (let i = layers.length - 1; i >= 0; i--) {
-    const l = layers[i];
-    if (!l.visible) continue;
-    ctx.globalAlpha = l.opacity;
-    ctx.drawImage(l.canvas, 0, 0);
-  }
-  ctx.globalAlpha = 1;
-}
-
-function renderLayers() {
-  const list = document.getElementById('layers-list');
-  if (!list) return;
-  list.innerHTML = layers.map((l,i) => `
+function renderLayers(){
+  const list=document.getElementById('layers-list');
+  list.innerHTML=layers.map((l,i)=>`
     <div class="layer-item ${i===activeLayerIdx?'active':''}" onclick="setActiveLayer(${i})">
       <div class="layer-thumb"><canvas id="lth-${i}" width="28" height="28"></canvas></div>
       ${l.name}
     </div>`).join('');
-  layers.forEach((l,i) => {
-    const th = document.getElementById('lth-'+i);
-    if (!th) return;
-    const tc = th.getContext('2d');
+  layers.forEach((l,i)=>{
+    const th=document.getElementById('lth-'+i);
+    if(!th) return;
+    const tc=th.getContext('2d');
     tc.clearRect(0,0,28,28);
     tc.drawImage(l.canvas,0,0,28,28);
   });
 }
 
-// ── Resize: save pixel data → resize → restore ───────────
-function resizeCanvas() {
-  const wrap = document.getElementById('canvas-wrap');
-  if (!wrap) return;
-  const W = wrap.clientWidth;
-  const H = wrap.clientHeight;
-  if (!W || !H) return;
+function setActiveLayer(i){ activeLayerIdx=i; renderLayers(); }
 
-  const saved = layers.map(l => {
-    if (!l.canvas.width || !l.canvas.height) return null;
-    return l.canvas.getContext('2d').getImageData(0, 0, l.canvas.width, l.canvas.height);
+function getActiveCtx(){ return layers[activeLayerIdx].canvas.getContext('2d'); }
+
+function compositeAll(){
+  ctx.clearRect(0,0,mainCanvas.width,mainCanvas.height);
+  [...layers].reverse().forEach(l=>{
+    if(!l.visible) return;
+    ctx.globalAlpha=l.opacity;
+    ctx.drawImage(l.canvas,0,0);
   });
+  ctx.globalAlpha=1;
+  renderLayers();
+}
 
-  mainCanvas.width  = W;
-  mainCanvas.height = H;
-  mainCanvas.style.width  = W + 'px';
-  mainCanvas.style.height = H + 'px';
-
-  layers.forEach((l, i) => {
-    l.canvas.width  = W;
-    l.canvas.height = H;
-    if (saved[i]) l.canvas.getContext('2d').putImageData(saved[i], 0, 0);
-  });
-
+function resizeCanvas(){
+  const wrap=document.getElementById('canvas-wrap');
+  const w=wrap.clientWidth, h=wrap.clientHeight;
+  const prev=ctx.getImageData(0,0,mainCanvas.width,mainCanvas.height);
+  mainCanvas.width=w; mainCanvas.height=h;
+  layers.forEach(l=>{ l.canvas.width=w; l.canvas.height=h; });
+  ctx.putImageData(prev,0,0);
   compositeAll();
 }
 
-// ── History: ImageData only (fully synchronous) ──────────
-function saveHistory() {
-  const lc = layers[activeLayerIdx].canvas;
-  historyStack.push({
-    idx:  activeLayerIdx,
-    data: lc.getContext('2d').getImageData(0, 0, lc.width, lc.height)
-  });
-  if (historyStack.length > 40) historyStack.shift();
-  redoStack = [];
+function saveHistory(){
+  const ac=getActiveCtx().canvas;
+  historyStack.push(ac.toDataURL());
+  if(historyStack.length>50) historyStack.shift();
+  redoStack=[];
 }
 
-function undo() {
-  if (!historyStack.length) return;
-  const entry = historyStack.pop();
-  const lc    = layers[entry.idx].canvas;
-  const lctx  = lc.getContext('2d');
-  redoStack.push({ idx: entry.idx, data: lctx.getImageData(0,0,lc.width,lc.height) });
-  lctx.putImageData(entry.data, 0, 0);
-  compositeAll(); renderLayers();
+function undo(){
+  if(!historyStack.length) return;
+  const ac=getActiveCtx();
+  redoStack.push(ac.canvas.toDataURL());
+  const prev=new Image();
+  prev.src=historyStack.pop();
+  prev.onload=()=>{ ac.clearRect(0,0,ac.canvas.width,ac.canvas.height); ac.drawImage(prev,0,0); compositeAll(); };
 }
 
-function redo() {
-  if (!redoStack.length) return;
-  const entry = redoStack.pop();
-  const lc    = layers[entry.idx].canvas;
-  const lctx  = lc.getContext('2d');
-  historyStack.push({ idx: entry.idx, data: lctx.getImageData(0,0,lc.width,lc.height) });
-  lctx.putImageData(entry.data, 0, 0);
-  compositeAll(); renderLayers();
+function redo(){
+  if(!redoStack.length) return;
+  const ac=getActiveCtx();
+  historyStack.push(ac.canvas.toDataURL());
+  const next=new Image();
+  next.src=redoStack.pop();
+  next.onload=()=>{ ac.clearRect(0,0,ac.canvas.width,ac.canvas.height); ac.drawImage(next,0,0); compositeAll(); };
 }
 
-function clearDraw() {
-  saveHistory();
-  const lc = layers[activeLayerIdx].canvas;
-  lc.getContext('2d').clearRect(0, 0, lc.width, lc.height);
-  compositeAll();
-}
+function clearDraw(){ saveHistory(); getActiveCtx().clearRect(0,0,mainCanvas.width,mainCanvas.height); compositeAll(); }
 
-// ── Tool / palette ───────────────────────────────────────
-function setTool(tool, el) {
-  currentTool = tool;
-  document.querySelectorAll('.draw-btn').forEach(b => b.classList.remove('active'));
+function setTool(tool,el){
+  currentTool=tool;
+  document.querySelectorAll('.draw-btn').forEach(b=>b.classList.remove('active'));
   el.classList.add('active');
-  mainCanvas.style.cursor =
-    tool === 'eraser' ? 'cell' :
-    tool === 'text'   ? 'text' : 'crosshair';
+  mainCanvas.style.cursor=tool==='eraser'?'cell':tool==='text'?'text':'crosshair';
 }
 
-function pickPalColor(el) {
-  document.querySelectorAll('.pal-color').forEach(e => e.classList.remove('active'));
-  el.classList.add('active');
-  drawCol = el.dataset.c;
-  const cc = document.getElementById('custom-col');
-  if (cc) cc.value = drawCol;
+function pickPalColor(el){
+  document.querySelectorAll('.pal-color').forEach(e=>e.classList.remove('active'));
+  el.classList.add('active'); drawCol=el.dataset.c;
+  document.getElementById('custom-col').value=drawCol;
 }
 
-function toggleLayers() {
+function toggleLayers(){
   document.getElementById('layers-panel').classList.toggle('open');
   document.getElementById('brush-panel').classList.remove('open');
 }
 
-function toggleBrushPanel() {
+function toggleBrushPanel(){
   document.getElementById('brush-panel').classList.toggle('open');
   document.getElementById('layers-panel').classList.remove('open');
 }
 
-function applyPreset(p, el) {
-  document.querySelectorAll('.brush-preset').forEach(b => b.classList.remove('active'));
+function applyPreset(p,el){
+  document.querySelectorAll('.brush-preset').forEach(b=>b.classList.remove('active'));
   el.classList.add('active');
-  const tb = document.getElementById('tb-' + p);
-  if (tb) setTool(p, tb);
+  setTool(p, document.getElementById('tb-'+p));
 }
 
-// ── Pointer position ─────────────────────────────────────
-function getXY(e) {
-  const r = mainCanvas.getBoundingClientRect();
-  if (e.touches && e.touches.length)
-    return { x: e.touches[0].clientX - r.left, y: e.touches[0].clientY - r.top };
-  return { x: e.clientX - r.left, y: e.clientY - r.top };
+/* ── Drawing behaviour per tool ─────────────────────────── */
+function applyStyle(c){
+  c.globalAlpha=bOpacity;
+  c.strokeStyle=currentTool==='eraser'?'rgba(0,0,0,1)':drawCol;
+  c.fillStyle=drawCol;
+  c.lineWidth=bSize;
+  c.lineCap='round'; c.lineJoin='round';
+  if(currentTool==='eraser') c.globalCompositeOperation='destination-out';
+  else c.globalCompositeOperation='source-over';
 }
 
-// ── Brush stroke on layer context ────────────────────────
-function doBrush(c, x, y, px, py) {
-  c.save();
-  c.lineCap  = 'round';
-  c.lineJoin = 'round';
+function getXY(e){
+  const r=mainCanvas.getBoundingClientRect();
+  if(e.touches) return {x:e.touches[0].clientX-r.left,y:e.touches[0].clientY-r.top};
+  return {x:e.clientX-r.left,y:e.clientY-r.top};
+}
 
-  if (currentTool === 'pen') {
-    c.globalCompositeOperation = 'source-over';
-    c.globalAlpha = bOpacity;
-    c.strokeStyle = drawCol;
-    c.lineWidth   = bSize;
-    c.beginPath(); c.moveTo(px, py); c.lineTo(x, y); c.stroke();
-
-  } else if (currentTool === 'ink') {
-    c.globalCompositeOperation = 'source-over';
-    c.globalAlpha = bOpacity * bFlow;
-    c.strokeStyle = drawCol;
-    c.lineWidth   = bSize * (0.5 + pressure);
-    c.beginPath(); c.moveTo(px, py); c.lineTo(x, y); c.stroke();
-
-  } else if (currentTool === 'chalk') {
-    c.globalCompositeOperation = 'source-over';
-    c.fillStyle = drawCol;
-    for (let i = 0; i < 9; i++) {
-      c.globalAlpha = bOpacity * (Math.random() * 0.45 + 0.08);
-      const rx = px + (x-px)*Math.random() + (Math.random()-0.5)*bSize*2.5;
-      const ry = py + (y-py)*Math.random() + (Math.random()-0.5)*bSize*2.5;
-      c.beginPath(); c.arc(rx, ry, bSize*(0.2+Math.random()*0.25), 0, Math.PI*2); c.fill();
+function brushStroke(c,x,y,px,py){
+  /* per-tool stroke style */
+  if(currentTool==='pen'){
+    c.beginPath(); c.moveTo(px,py); c.lineTo(x,y); c.stroke();
+  } else if(currentTool==='ink'){
+    c.globalAlpha=bOpacity*bFlow;
+    c.lineWidth=bSize*(0.7+pressure*0.6);
+    c.beginPath(); c.moveTo(px,py); c.lineTo(x,y); c.stroke();
+  } else if(currentTool==='chalk'){
+    /* chalk = scattered dots */
+    for(let i=0;i<6;i++){
+      const rx=px+(x-px)*Math.random()+(Math.random()-0.5)*bSize*1.5;
+      const ry=py+(y-py)*Math.random()+(Math.random()-0.5)*bSize*1.5;
+      c.globalAlpha=bOpacity*(Math.random()*0.4+0.1);
+      c.beginPath(); c.arc(rx,ry,bSize*0.35,0,Math.PI*2); c.fill();
     }
-
-  } else if (currentTool === 'marker') {
-    c.globalCompositeOperation = 'source-over';
-    c.globalAlpha = bOpacity * 0.4;
-    c.strokeStyle = drawCol;
-    c.lineWidth   = bSize * 2.4;
-    c.lineCap     = 'square';
-    c.beginPath(); c.moveTo(px, py); c.lineTo(x, y); c.stroke();
-
-  } else if (currentTool === 'water') {
-    c.globalCompositeOperation = 'source-over';
-    c.strokeStyle = drawCol;
-    for (let i = 0; i < 5; i++) {
-      c.globalAlpha = bOpacity * bFlow * 0.09;
-      c.lineWidth   = bSize * (0.9 + Math.random() * 0.9);
-      const ox = (Math.random()-0.5)*bSize*1.2;
-      const oy = (Math.random()-0.5)*bSize*1.2;
-      c.beginPath(); c.moveTo(px+ox, py+oy); c.lineTo(x+ox, y+oy); c.stroke();
+    c.globalAlpha=bOpacity;
+  } else if(currentTool==='marker'){
+    c.globalAlpha=bOpacity*0.55;
+    c.lineWidth=bSize*1.8;
+    c.lineCap='square';
+    c.beginPath(); c.moveTo(px,py); c.lineTo(x,y); c.stroke();
+    c.lineCap='round'; c.lineWidth=bSize;
+  } else if(currentTool==='water'){
+    /* watercolour: soft semitransparent smear */
+    c.globalAlpha=bOpacity*bFlow*0.18;
+    for(let i=0;i<3;i++){
+      const ox=(Math.random()-0.5)*bSize*0.8, oy=(Math.random()-0.5)*bSize*0.8;
+      c.lineWidth=bSize*(1.2+Math.random()*0.6);
+      c.beginPath(); c.moveTo(px+ox,py+oy); c.lineTo(x+ox,y+oy); c.stroke();
     }
-
-  } else if (currentTool === 'smudge') {
-    try {
-      const r  = Math.max(2, Math.ceil(bSize));
-      const sx = Math.max(0, Math.floor(x)-r);
-      const sy = Math.max(0, Math.floor(y)-r);
-      const sw = Math.min(r*2, c.canvas.width  - sx);
-      const sh = Math.min(r*2, c.canvas.height - sy);
-      if (sw > 0 && sh > 0) {
-        const patch = c.getImageData(sx, sy, sw, sh);
-        const dx = Math.round((x-px)*0.5);
-        const dy = Math.round((y-py)*0.5);
-        c.globalAlpha = 0.4 * bFlow;
-        c.globalCompositeOperation = 'source-over';
-        c.putImageData(patch, sx+dx, sy+dy);
-      }
-    } catch(_) {}
-
-  } else if (currentTool === 'eraser') {
-    c.globalCompositeOperation = 'destination-out';
-    c.globalAlpha = 1;
-    c.strokeStyle = 'rgba(0,0,0,1)';
-    c.lineWidth   = bSize * 2.5;
-    c.beginPath(); c.moveTo(px, py); c.lineTo(x, y); c.stroke();
+    c.globalAlpha=bOpacity;
+  } else if(currentTool==='smudge'){
+    /* smudge: copy nearby pixels with blur effect */
+    try{
+      const smudge=c.getImageData(x-bSize,y-bSize,bSize*2,bSize*2);
+      c.globalAlpha=0.25*bFlow;
+      c.putImageData(smudge,px-bSize,py-bSize);
+      c.globalAlpha=bOpacity;
+    }catch(e){}
+  } else if(currentTool==='eraser'){
+    c.beginPath(); c.arc(x,y,bSize,0,Math.PI*2); c.fill();
   }
-
-  c.restore();
 }
 
-// ── Shape preview (synchronous ImageData swap) ───────────
-function drawShapePreview(x, y) {
-  if (!snapImageData) return;
-  const lc   = layers[activeLayerIdx].canvas;
-  const lctx = lc.getContext('2d');
-  lctx.putImageData(snapImageData, 0, 0);
-  lctx.save();
-  lctx.globalCompositeOperation = 'source-over';
-  lctx.globalAlpha = bOpacity;
-  lctx.strokeStyle = drawCol;
-  lctx.lineWidth   = bSize;
-  lctx.lineCap     = 'round';
-  lctx.lineJoin    = 'round';
-  lctx.beginPath();
-  if (currentTool === 'line') {
-    lctx.moveTo(startX, startY); lctx.lineTo(x, y); lctx.stroke();
-  } else if (currentTool === 'rect') {
-    lctx.strokeRect(startX, startY, x-startX, y-startY);
-  } else if (currentTool === 'circle') {
-    const rx = (x-startX)/2, ry = (y-startY)/2;
-    lctx.ellipse(startX+rx, startY+ry, Math.abs(rx), Math.abs(ry), 0, 0, Math.PI*2);
-    lctx.stroke();
-  }
-  lctx.restore();
-  compositeAll();
-}
-
-// ── Pointer events ────────────────────────────────────────
-mainCanvas.addEventListener('pointerdown', function(e) {
+mainCanvas.addEventListener('pointerdown',e=>{
   e.preventDefault();
-  if (currentTool === 'text') { placeText(e); return; }
-  if (currentTool === 'fill') { floodFill(e); return; }
-  isDown = true;
-  const p = getXY(e);
-  lastX = startX = p.x;
-  lastY = startY = p.y;
-  pressure = (e.pressure > 0.01) ? e.pressure : 0.5;
+  if(currentTool==='text'){ placeText(e); return; }
+  if(currentTool==='fill'){ floodFill(e); return; }
   saveHistory();
-  const lc = layers[activeLayerIdx].canvas;
-  snapImageData = lc.getContext('2d').getImageData(0, 0, lc.width, lc.height);
+  isDown=true;
+  const p=getXY(e); lastX=startX=p.x; lastY=startY=p.y;
+  pressure=e.pressure||0.5;
+  const ac=getActiveCtx();
+  applyStyle(ac);
+  if(['pen','ink','chalk','marker','water','eraser','smudge'].includes(currentTool)){
+    ac.beginPath(); ac.moveTo(lastX,lastY);
+  }
+  snapData=getActiveCtx().canvas.toDataURL();
 });
 
-mainCanvas.addEventListener('pointermove', function(e) {
+mainCanvas.addEventListener('pointermove',e=>{
   e.preventDefault();
-  if (!isDown) return;
-  const p = getXY(e);
-  if (e.pressure > 0.01) pressure = e.pressure;
-  if (['line','rect','circle'].includes(currentTool)) {
-    drawShapePreview(p.x, p.y);
+  if(!isDown) return;
+  const p=getXY(e);
+  pressure=e.pressure||pressure;
+  const ac=getActiveCtx();
+  applyStyle(ac);
+  if(['pen','ink','chalk','marker','water','eraser','smudge'].includes(currentTool)){
+    brushStroke(ac,p.x,p.y,lastX,lastY);
+    lastX=p.x; lastY=p.y;
+    compositeAll();
   } else {
-    doBrush(getLCtx(), p.x, p.y, lastX, lastY);
+    /* shape preview: redraw from snap */
+    const img=new Image(); img.src=snapData;
+    ac.clearRect(0,0,ac.canvas.width,ac.canvas.height);
+    ac.drawImage(img,0,0);
+    applyStyle(ac); ac.beginPath();
+    if(currentTool==='line'){
+      ac.moveTo(startX,startY); ac.lineTo(p.x,p.y); ac.stroke();
+    } else if(currentTool==='rect'){
+      ac.strokeRect(startX,startY,p.x-startX,p.y-startY);
+    } else if(currentTool==='circle'){
+      const rx=(p.x-startX)/2,ry=(p.y-startY)/2;
+      ac.ellipse(startX+rx,startY+ry,Math.abs(rx),Math.abs(ry),0,0,Math.PI*2); ac.stroke();
+    }
     compositeAll();
   }
-  lastX = p.x;
-  lastY = p.y;
 });
 
-mainCanvas.addEventListener('pointerup', function() {
-  isDown = false;
-  snapImageData = null;
-  compositeAll();
-  renderLayers();
-});
+mainCanvas.addEventListener('pointerup',()=>{ isDown=false; snapData=null; compositeAll(); renderLayers(); });
+mainCanvas.addEventListener('pointerleave',()=>{ isDown=false; });
 
-mainCanvas.addEventListener('pointerleave', function() {
-  isDown = false;
-});
-
-// ── Text tool ─────────────────────────────────────────────
-function placeText(e) {
-  if (textEl) { commitText(); return; }
-  const p  = getXY(e);
-  const fs = Math.max(14, bSize * 2.8);
-  textEl   = document.createElement('input');
-  textEl.style.cssText = [
-    'position:absolute',
-    'left:' + p.x + 'px',
-    'top:'  + (p.y - fs*0.7) + 'px',
-    'background:transparent',
-    'border:none',
-    'border-bottom:2px dashed ' + drawCol,
-    'color:' + drawCol,
-    'font-size:' + fs + 'px',
-    'outline:none',
-    'z-index:30',
-    'min-width:140px',
-    "font-family:'Playfair Display',serif",
-    'font-style:italic',
-    'padding:2px 6px'
-  ].join(';');
+function placeText(e){
+  if(textEl){ commitText(); return; }
+  const p=getXY(e);
+  textEl=document.createElement('input');
+  textEl.style.cssText=`position:absolute;left:${p.x}px;top:${p.y}px;background:transparent;
+    border:none;border-bottom:1.5px dashed ${drawCol};color:${drawCol};
+    font-size:${Math.max(14,bSize*2.5)}px;outline:none;z-index:20;min-width:90px;
+    font-family:'Playfair Display',serif;font-style:italic;padding:2px 4px;`;
   document.getElementById('canvas-wrap').appendChild(textEl);
-  textEl.focus();
-  textEl._pos = p;
-  textEl.addEventListener('keydown', function(ev) {
-    if (ev.key === 'Enter')  { ev.preventDefault(); commitText(); }
-    if (ev.key === 'Escape') { textEl.remove(); textEl = null; }
-  });
-  textEl.addEventListener('blur', function() { setTimeout(commitText, 200); });
+  textEl.focus(); textEl._pos=p;
+  textEl.addEventListener('keydown',ev=>{ if(ev.key==='Enter') commitText(); if(ev.key==='Escape'){ textEl.remove(); textEl=null; } });
+  textEl.addEventListener('blur',()=>setTimeout(commitText,120));
 }
 
-function commitText() {
-  if (!textEl) return;
-  const val = textEl.value.trim();
-  const p   = textEl._pos;
-  textEl.remove(); textEl = null;
-  if (!val) return;
-  const lctx = getLCtx();
+function commitText(){
+  if(!textEl) return;
+  const val=textEl.value.trim(); const p=textEl._pos;
+  textEl.remove(); textEl=null;
+  if(!val) return;
   saveHistory();
-  lctx.save();
-  lctx.globalCompositeOperation = 'source-over';
-  lctx.globalAlpha = bOpacity;
-  lctx.fillStyle   = drawCol;
-  lctx.font = 'italic ' + Math.max(14, bSize*2.8) + "px 'Playfair Display',serif";
-  lctx.fillText(val, p.x, p.y);
-  lctx.restore();
+  const ac=getActiveCtx();
+  ac.globalAlpha=bOpacity; ac.fillStyle=drawCol;
+  ac.globalCompositeOperation='source-over';
+  ac.font=`italic ${Math.max(14,bSize*2.5)}px 'Playfair Display',serif`;
+  ac.fillText(val,p.x,p.y+Math.max(14,bSize*2.5));
   compositeAll(); renderLayers();
 }
 
-// ── Flood fill ────────────────────────────────────────────
-function floodFill(e) {
-  const p    = getXY(e);
-  const lc   = layers[activeLayerIdx].canvas;
-  const lctx = lc.getContext('2d');
+function floodFill(e){
   saveHistory();
-  const imgData = lctx.getImageData(0, 0, lc.width, lc.height);
-  const data = imgData.data;
-  const W = lc.width, H = lc.height;
-  const cx = Math.floor(p.x), cy = Math.floor(p.y);
-  if (cx < 0 || cy < 0 || cx >= W || cy >= H) return;
-  const si = (cy*W + cx)*4;
-  const tR=data[si], tG=data[si+1], tB=data[si+2], tA=data[si+3];
-  const fc = hexToRgb(drawCol);
-  if (!fc) return;
-  const fA = Math.round(bOpacity * 255);
-  if (fc.r===tR && fc.g===tG && fc.b===tB && fA===tA) return;
-  const visited = new Uint8Array(W * H);
-  const stack = [cy*W + cx];
-  while (stack.length) {
-    const pos = stack.pop();
-    if (visited[pos]) continue;
-    const x = pos % W, y = Math.floor(pos / W);
-    if (x < 0 || y < 0 || x >= W || y >= H) continue;
-    const i = pos * 4;
-    if (Math.abs(data[i]-tR)>28||Math.abs(data[i+1]-tG)>28||
-        Math.abs(data[i+2]-tB)>28||Math.abs(data[i+3]-tA)>28) continue;
-    visited[pos] = 1;
-    data[i]=fc.r; data[i+1]=fc.g; data[i+2]=fc.b; data[i+3]=fA;
-    if (x+1 < W)  stack.push(pos+1);
-    if (x-1 >= 0) stack.push(pos-1);
-    if (y+1 < H)  stack.push(pos+W);
-    if (y-1 >= 0) stack.push(pos-W);
+  const p=getXY(e);
+  const ac=getActiveCtx();
+  const imgData=ac.getImageData(0,0,ac.canvas.width,ac.canvas.height);
+  const data=imgData.data;
+  const w=ac.canvas.width, h=ac.canvas.height;
+  const cx=Math.floor(p.x), cy=Math.floor(p.y);
+  if(cx<0||cy<0||cx>=w||cy>=h) return;
+  const idx=(cy*w+cx)*4;
+  const tR=data[idx],tG=data[idx+1],tB=data[idx+2],tA=data[idx+3];
+  const fc=hexToRgb(drawCol);
+  if(!fc) return;
+  const stack=[[cx,cy]]; const seen=new Set();
+  while(stack.length){
+    const [x,y]=stack.pop();
+    const key=y*w+x; if(seen.has(key)) continue;
+    if(x<0||y<0||x>=w||y>=h) continue;
+    const i=(y*w+x)*4;
+    if(Math.abs(data[i]-tR)>30||Math.abs(data[i+1]-tG)>30||Math.abs(data[i+2]-tB)>30||Math.abs(data[i+3]-tA)>30) continue;
+    seen.add(key);
+    data[i]=fc.r; data[i+1]=fc.g; data[i+2]=fc.b; data[i+3]=Math.round(bOpacity*255);
+    stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
   }
-  lctx.putImageData(imgData, 0, 0);
-  compositeAll(); renderLayers();
+  ac.putImageData(imgData,0,0); compositeAll(); renderLayers();
 }
 
-function hexToRgb(hex) {
-  const r = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return r ? { r:parseInt(r[1],16), g:parseInt(r[2],16), b:parseInt(r[3],16) } : null;
+function hexToRgb(hex){
+  const r=/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return r?{r:parseInt(r[1],16),g:parseInt(r[2],16),b:parseInt(r[3],16)}:null;
 }
 
-// ── Save PNG ──────────────────────────────────────────────
-function saveDrawing() {
-  const out = document.createElement('canvas');
-  out.width = mainCanvas.width; out.height = mainCanvas.height;
-  const oc  = out.getContext('2d');
-  oc.fillStyle = '#fdf6ee'; oc.fillRect(0, 0, out.width, out.height);
-  for (let i = layers.length-1; i >= 0; i--) {
-    const l = layers[i]; if (!l.visible) continue;
-    oc.globalAlpha = l.opacity; oc.drawImage(l.canvas, 0, 0);
-  }
-  const a = document.createElement('a');
-  a.download = 'petal-drawing.png'; a.href = out.toDataURL(); a.click();
+function saveDrawing(){
+  const out=document.createElement('canvas');
+  out.width=mainCanvas.width; out.height=mainCanvas.height;
+  const oc=out.getContext('2d');
+  oc.fillStyle=var2hex('--cream'); oc.fillRect(0,0,out.width,out.height);
+  [...layers].reverse().forEach(l=>{ if(l.visible){ oc.globalAlpha=l.opacity; oc.drawImage(l.canvas,0,0); } });
+  const a=document.createElement('a');
+  a.download='petal-drawing.png'; a.href=out.toDataURL(); a.click();
 }
 
-// ── Touch → Pointer ───────────────────────────────────────
-mainCanvas.addEventListener('touchstart', function(e) {
-  e.preventDefault();
-  var t = e.touches[0];
-  mainCanvas.dispatchEvent(new PointerEvent('pointerdown',
-    { clientX:t.clientX, clientY:t.clientY, pressure:0.5, bubbles:true }));
-}, { passive: false });
+function var2hex(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
 
-mainCanvas.addEventListener('touchmove', function(e) {
-  e.preventDefault();
-  var t = e.touches[0];
-  mainCanvas.dispatchEvent(new PointerEvent('pointermove',
-    { clientX:t.clientX, clientY:t.clientY, pressure:0.5, bubbles:true }));
-}, { passive: false });
+// Touch support
+mainCanvas.addEventListener('touchstart',e=>{e.preventDefault();const t=e.touches[0];mainCanvas.dispatchEvent(new PointerEvent('pointerdown',{clientX:t.clientX,clientY:t.clientY,pressure:0.5}));},{passive:false});
+mainCanvas.addEventListener('touchmove', e=>{e.preventDefault();const t=e.touches[0];mainCanvas.dispatchEvent(new PointerEvent('pointermove',{clientX:t.clientX,clientY:t.clientY,pressure:0.5}));},{passive:false});
+mainCanvas.addEventListener('touchend', e=>{e.preventDefault();mainCanvas.dispatchEvent(new PointerEvent('pointerup'));},{passive:false});
 
-mainCanvas.addEventListener('touchend', function(e) {
-  e.preventDefault();
-  mainCanvas.dispatchEvent(new PointerEvent('pointerup', { bubbles:true }));
-}, { passive: false });
-
-// ── Keyboard shortcuts ─────────────────────────────────────
-document.addEventListener('keydown', function(e) {
-  if (e.ctrlKey && e.key === 'z') { undo(); e.preventDefault(); }
-  if (e.ctrlKey && e.key === 'y') { redo(); e.preventDefault(); }
+// Keyboard
+document.addEventListener('keydown',e=>{
+  if(e.ctrlKey&&e.key==='z'){undo();e.preventDefault();}
+  if(e.ctrlKey&&e.key==='y'){redo();e.preventDefault();}
 });
 
-window.addEventListener('resize', function() {
-  if (document.getElementById('panel-draw').classList.contains('active')) resizeCanvas();
-});
+window.addEventListener('resize',()=>{ if(document.getElementById('panel-draw').classList.contains('active')) resizeCanvas(); });
 
-/* ═══ BOOT ════════════════════════════════════════════════ */
-renderTasks(); renderNotes();
+/* ═══ BOOT ═══ */
+renderTasks();
+renderNotes();
+// Pre-populate with sample data for demo
 DB.addTask('pick up flowers 🌷','Personal','high',now());
 DB.addTask('finish design moodboard','Work','medium',now());
 DB.addTask('read chapter 3 📚','Study','low',now());
@@ -1475,15 +1327,8 @@ DB.addNote('Gratitude list 🌷','Today I am grateful for morning light, warm te
 DB.addNote('Dream log 🌙','I was in a library made of clouds, every book glowed golden…','skin-lavender','dream',now());
 DB.addNote('Recipe 🍵','Matcha latte: 1 tsp matcha, oat milk, honey, vanilla…','skin-sage','recipe',now());
 renderTasks(); renderNotes();
-
-/* Canvas boots after two rAF so the draw panel has real pixel dimensions */
-requestAnimationFrame(function() {
-  requestAnimationFrame(function() {
-    initLayers();
-    resizeCanvas();
-  });
-});
-
+initLayers();
+setTimeout(resizeCanvas,50);
 </script>
 </body>
 </html>
