@@ -1,4 +1,4 @@
-# TaskBoard — C++ WebAssembly Todo App
+# TaskBoard - C++ WebAssembly Todo App
 
 A simple todo and notes web app built using C++ compiled to WebAssembly with Emscripten and a basic HTML frontend.
 
